@@ -11,7 +11,7 @@ from dwave.system import DWaveSampler, EmbeddingComposite
 import dimod
 
 # Set the D-Wave API token
-os.environ["DWAVE_API_TOKEN"] = "DEV-8993a7bdca6eb20d80a3525ccd3e699e78df16fb"
+os.environ["DWAVE_API_TOKEN"] = ""
 
 # Configure logging
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s:%(levelname)s:%(message)s')
