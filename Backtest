@@ -1,0 +1,224 @@
+import pandas as pd
+import logging
+from datetime import datetime, timedelta
+import pickle
+import random
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+import alpaca_trade_api as tradeapi
+from alpaca_trade_api.rest import TimeFrame
+
+# Configure logging
+logging.basicConfig(filename='trading_bot.log', level=logging.DEBUG, format='%(asctime)s:%(levelname)s:%(message)s')
+
+# Alpaca API credentials (replace with your actual credentials)
+ALPACA_API_KEY = ''
+ALPACA_SECRET_KEY = ''
+APCA_API_BASE_URL = ''
+
+# Initialize Alpaca API
+alpaca = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, APCA_API_BASE_URL, api_version='v2')
+
+def log_activity(message):
+    logging.info(message)
+    print(message)  # Also print to console for real-time feedback
+
+def debug_activity(message):
+    logging.debug(message)
+    print(message)  # Also print to console for real-time feedback
+
+def get_alpaca_data(symbol, start_date, end_date):
+    debug_activity(f"Fetching data for {symbol} from {start_date} to {end_date}")
+    barset = alpaca.get_bars(symbol, TimeFrame.Day, start=start_date, end=end_date).df
+    barset = barset.reset_index()[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+    barset.columns = ['Date', 'Open', 'High', 'Low', 'Close/Last', 'Volume']
+    barset['Date'] = barset['Date'].apply(lambda x: x.toordinal())
+    debug_activity(f"Data fetched, shape: {barset.shape}")
+    return barset
+
+def preprocess_data(data):
+    debug_activity("Preprocessing data")
+    # Drop any remaining non-numeric columns
+    data = data.select_dtypes(include=[int, float])
+
+    # Drop rows with any NaN values
+    data = data.dropna()
+
+    debug_activity(f"Data preprocessed, shape: {data.shape}")
+    return data
+
+def detect_support_resistance(data):
+    debug_activity("Detecting support and resistance levels")
+    data['support'] = data['Close/Last'].rolling(window=20).min()
+    data['resistance'] = data['Close/Last'].rolling(window=20).max()
+    return data
+
+class SimulatedEnvironment:
+    def __init__(self, historical_data, feature_columns):
+        self.historical_data = historical_data
+        self.current_step = 0
+        self.feature_columns = feature_columns
+        self.initial_balance = 100000  # Example initial balance
+        self.balance = self.initial_balance
+        self.position = None
+        self.entry_price = 0
+        self.hold_duration = 0
+
+    def reset(self, start_step):
+        self.current_step = start_step
+        self.balance = self.initial_balance
+        self.position = None
+        self.entry_price = 0
+        self.hold_duration = 0
+        log_activity("Simulation reset")
+        debug_activity(f"Starting at step {self.current_step}")
+        return self.historical_data.iloc[self.current_step]
+
+    def step(self, action):
+        self.current_step += 1
+        if self.current_step >= len(self.historical_data):
+            done = True
+            next_state = None
+        else:
+            done = False
+            next_state = self.historical_data.iloc[self.current_step]
+
+        reward = self.calculate_reward(action)
+        debug_activity(f"Step: {self.current_step}, Action: {action}, Reward: {reward}, Balance: {self.balance}")
+        return next_state, reward, done
+
+    def calculate_reward(self, action):
+        if self.current_step >= len(self.historical_data):
+            return 0  # No reward if we're beyond the end of the data
+
+        current_price = self.historical_data.iloc[self.current_step]['Close/Last']
+        transaction_fee = 0  # Default transaction fee
+
+        # Calculate transaction fee based on Charles Schwab's structure
+        trade_amount = current_price * 100  # Assuming 100 shares per trade
+        if trade_amount < 100:
+            transaction_fee = 0
+        else:
+            transaction_fee = min(8.5 / 100 * trade_amount, 74.95)
+
+        if self.position is None and action == 1:  # Buy
+            self.position = 'long'
+            self.entry_price = current_price
+            self.hold_duration = 0
+            self.balance -= transaction_fee
+            self.place_order('buy', 100)  # Place buy order via Alpaca
+            debug_activity(f"Buying at {current_price}, fee: {transaction_fee}")
+            return -transaction_fee  # Immediate cost for entering a position
+
+        if self.position == 'long':
+            self.hold_duration += 1
+            if action == 2:  # Sell
+                profit = (current_price - self.entry_price) * 100 - transaction_fee  # Net profit after transaction fee
+                self.balance += profit
+                reward = profit
+                self.position = None
+                self.entry_price = 0
+                self.hold_duration = 0
+                self.place_order('sell', 100)  # Place sell order via Alpaca
+                debug_activity(f"Selling at {current_price}, profit: {profit}, fee: {transaction_fee}")
+                return reward
+
+        # Reward for holding a position
+        if self.position == 'long':
+            return 0.01 * self.hold_duration  # Small reward for holding
+
+        return 0  # No reward for other actions
+
+    def place_order(self, side, qty):
+        try:
+            alpaca.submit_order(
+                symbol='SPY',
+                qty=qty,
+                side=side,
+                type='market',
+                time_in_force='day'
+            )
+            log_activity(f"Placed {side} order for {qty} shares.")
+        except Exception as e:
+            log_activity(f"Failed to place {side} order: {e}")
+
+def analyze_sentiment(state):
+    if 'Close/Last' in state.index and 'Open' in state.index:
+        if state['Close/Last'] > state['Open']:
+            return 1  # Positive sentiment
+        elif state['Close/Last'] < state['Open']:
+            return -1  # Negative sentiment
+        else:
+            return 0  # Neutral sentiment
+    else:
+        return 0  # Default to neutral if data is missing
+
+def make_decision(state, q_table, feature_columns):
+    if state is None:
+        debug_activity("State is None, returning default action 0")
+        return 0  # Default action if state is None
+
+    features = state[feature_columns].values.reshape(1, -1)
+    sentiment_score = analyze_sentiment(state)
+    state_key = (tuple(features[0]), sentiment_score)
+
+    if state_key not in q_table:
+        debug_activity(f"State key {state_key} not found in Q-table, initializing")
+        q_table[state_key] = [0, 0, 0]  # Initialize Q-values for actions: [hold, buy, sell]
+
+    action = np.argmax(q_table[state_key])
+    debug_activity(f"Decision made: {action} for state: {state_key}")
+    return action
+
+# Example usage
+def main():
+    symbol = 'SPY'
+    start_date = datetime(2020, 1, 1).strftime('%Y-%m-%d')  # Example start date
+    end_date = (datetime(2020, 2, 1) + timedelta(days=30)).strftime('%Y-%m-%d')
+
+    # Load data from Alpaca
+    data = get_alpaca_data(symbol, start_date, end_date)
+
+    if data.empty:
+        log_activity("No data received from Alpaca. Exiting.")
+        return
+
+    # Preprocess data and detect support/resistance levels
+    data = preprocess_data(data)
+    data = detect_support_resistance(data)
+    feature_columns = data.columns.drop(['Close/Last', 'support', 'resistance'])
+
+    # Load the trained model and Q-table
+    with open('trained_model.pkl', 'rb') as f:
+        model = pickle.load(f)
+    with open('q_table.pkl', 'rb') as f:
+        q_table = pickle.load(f)
+
+    # Initialize simulated environment
+    sim_env = SimulatedEnvironment(data, feature_columns)
+
+    # Simulate trading for a single day over a month
+    for day in range(30):
+        try:
+            current_step = data[data['Date'] == datetime.strptime(start_date, '%Y-%m-%d').toordinal()].index[0]
+        except IndexError:
+            log_activity(f"Date {start_date} not found in the data. Skipping to the next day.")
+            start_date = (datetime.strptime(start_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+            continue
+
+        state = sim_env.reset(current_step)
+        done = False
+        while not done:
+            if state is None:  # Check if state is None before making a decision
+                log_activity(f"No more data available at step {sim_env.current_step}.")
+                break
+
+            action = make_decision(state, q_table, feature_columns)
+            next_state, reward, done = sim_env.step(action)
+            state = next_state
+
+        log_activity(f"Day {day + 1}: Balance: {sim_env.balance}")
+        start_date = (datetime.strptime(start_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+
+if __name__ == "__main__":
+    main()
