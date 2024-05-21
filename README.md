@@ -4,7 +4,7 @@ This repository contains two Python scripts: Human_QC.py and Testing_Simulation.
 
 Files and Functionality
 Human_QC.py
-This script trains a Q-learning model to make trading decisions and integrates quantum computing for optimization.
+This script trains a Q-learning model to make trading decisions and integrates quantum computing for optimization meaning the program uses a quantum computer (specifically, a D-Wave quantum annealer) to solve optimization problems formulated as Quadratic Unconstrained Binary Optimization (QUBO) problems.
 
 Key Functions:
 log_activity(message): Logs and prints messages for real-time feedback.
