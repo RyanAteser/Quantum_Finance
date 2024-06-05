@@ -1,0 +1,306 @@
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+from scipy.stats import norm, kstest, levy_stable, t
+import pywt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from qiskit import Aer
+from qiskit.utils import algorithm_globals
+from qiskit.algorithms import QAOA, VQE
+from qiskit_optimization import QuadraticProgram
+from qiskit_optimization.algorithms import MinimumEigenOptimizer
+from qiskit_optimization.converters import QuadraticProgramToQubo
+# Fetch stock data
+ticker = 'AAPL'  # You can change this to any other stock ticker
+stock = yf.Ticker(ticker)
+hist = stock.history(period="5y")  # Fetch 5 years of historical data
+
+# Calculate daily returns and volume
+returns = hist['Close'].pct_change().dropna()
+volume = hist['Volume'].dropna()
+
+# Normalize returns
+mean_return = np.mean(returns)
+std_return = np.std(returns)
+normalized_returns = (returns - mean_return) / std_return
+
+# Debugging: Check for empty or invalid data
+print(f"Mean return: {mean_return}, Std return: {std_return}")
+print(f"First few normalized returns: {normalized_returns.head()}")
+
+# Dynamic window size based on volume
+window_size = int(np.mean(volume) / np.std(volume))
+if window_size < 1:
+    window_size = 1
+
+# Dynamic levels for wavelet decomposition
+def determine_levels(volume):
+    avg_volume = np.mean(volume)
+    std_volume = np.std(volume)
+    return max(1, int(np.log2(avg_volume / std_volume)))
+
+max_level = determine_levels(volume)
+print(f"Determined max level for wavelet decomposition: {max_level}")
+
+# Dynamic scales for MFDFA based on volume
+min_scale = max(10, int(np.mean(volume) / 1000))
+max_scale = min(1000, int(np.mean(volume) / 100))
+print(f"Dynamic min_scale: {min_scale}, max_scale: {max_scale}")
+
+# Advanced synthetic data generation for financial data
+def synthetic_data_distribution(size, volume, distribution='levy_stable'):
+    alpha = 1.7  # Tail index for heavy tails
+    beta = np.clip(np.mean(volume) / np.std(volume), -1, 1)
+    if distribution == 'levy_stable':
+        return levy_stable.rvs(alpha, beta, size=size)
+    elif distribution == 't':
+        df = max(1, int(np.mean(volume) / np.std(volume)))  # degrees of freedom for t-distribution
+        return t.rvs(df, size=size)
+    elif distribution == 'normal':
+        return np.random.normal(size=size)
+    else:
+        raise ValueError("Unsupported distribution type")
+
+# Generate synthetic data using different distributions and parameters
+distributions = ['levy_stable', 't', 'normal']
+synthetic_datasets = []
+
+for dist in distributions:
+    synthetic_data = synthetic_data_distribution(size=1000, volume=volume, distribution=dist)
+    synthetic_datasets.append((dist, synthetic_data))
+
+# Plot the distributions
+plt.figure(figsize=(12, 6))
+plt.hist(normalized_returns, bins=50, density=True, alpha=0.5, label='Normalized Returns')
+for dist, syn_data in synthetic_datasets:
+    plt.hist(syn_data, bins=50, density=True, alpha=0.5, label=f'Synthetic ({dist})')
+plt.xlim([-5, 5])  # Adjusting x-axis to focus on relevant range
+plt.title('Comparison of Normalized Returns and Synthetic Distributions')
+plt.xlabel('Value')
+plt.ylabel('Density')
+plt.legend()
+plt.show()
+
+# Statistical Tests
+for dist, syn_data in synthetic_datasets:
+    ks_statistic_syn, p_value_syn = kstest(syn_data, 'norm')
+    print(f"KS Statistic (Synthetic, {dist}): {ks_statistic_syn}, p-value: {p_value_syn}")
+
+# Multifractal analysis with different wavelet types
+def multifractal_spectrum(time_series, wavelets=['db1', 'db2', 'sym2', 'coif1', 'bior1.3'], max_level=max_level):
+    scaling_exponents_dict = {}
+
+    for wavelet in wavelets:
+        # Perform wavelet decomposition
+        coeffs = pywt.wavedec(time_series, wavelet, level=max_level)
+
+        # Calculate scaling exponents for multiple levels
+        scaling_exponents = []
+        for level in range(1, max_level + 1):
+            scales = np.arange(1, len(coeffs[level]) + 1)
+            log_scales = np.log(scales)
+            abs_coeffs = np.abs(coeffs[level])
+
+            # Filter out zero or negative coefficients
+            abs_coeffs = abs_coeffs[abs_coeffs > 0]
+            if len(abs_coeffs) == 0:
+                scaling_exponents.append(np.nan)
+                continue
+
+            log_coeffs = np.log(abs_coeffs)
+
+            # Perform linear regression to find scaling exponents
+            fit = np.polyfit(log_scales[:len(log_coeffs)], log_coeffs, 1)
+            scaling_exponents.append(fit[0])
+
+        scaling_exponents_dict[wavelet] = scaling_exponents
+
+    return scaling_exponents_dict
+
+# Perform multifractal analysis
+wavelets = ['db1', 'db2', 'sym2', 'coif1', 'bior1.3']
+scaling_exponents_dict = multifractal_spectrum(returns.values, wavelets=wavelets)
+
+# Display the scaling exponents
+for wavelet, exponents in scaling_exponents_dict.items():
+    print(f"Scaling Exponents for wavelet {wavelet}: {exponents}")
+
+# Plot the results
+plt.figure(figsize=(12, 6))
+plt.plot(returns)
+plt.title('Daily Returns')
+plt.xlabel('Time')
+plt.ylabel('Returns')
+plt.show()
+
+# Visualize scaling exponents for different wavelet types
+plt.figure(figsize=(12, 6))
+for wavelet, exponents in scaling_exponents_dict.items():
+    plt.plot(range(1, len(exponents) + 1), exponents, marker='o', label=wavelet)
+plt.title('Scaling Exponents Across Different Wavelet Levels and Types')
+plt.xlabel('Wavelet Level')
+plt.ylabel('Scaling Exponent')
+plt.legend()
+plt.show()
+
+# Detailed analysis with 'bior1.3' wavelet
+def detailed_multifractal_analysis(time_series, wavelet='bior1.3', max_level=max_level):
+    # Perform wavelet decomposition
+    coeffs = pywt.wavedec(time_series, wavelet, level=max_level)
+
+    # Calculate scaling exponents for multiple levels
+    scaling_exponents = []
+    for level in range(1, max_level + 1):
+        scales = np.arange(1, len(coeffs[level]) + 1)
+        log_scales = np.log(scales)
+        abs_coeffs = np.abs(coeffs[level])
+
+        # Filter out zero or negative coefficients
+        abs_coeffs = abs_coeffs[abs_coeffs > 0]
+        if len(abs_coeffs) == 0:
+            scaling_exponents.append(np.nan)
+            continue
+
+        log_coeffs = np.log(abs_coeffs)
+
+        # Perform linear regression to find scaling exponents
+        fit = np.polyfit(log_scales[:len(log_coeffs)], log_coeffs, 1)
+        scaling_exponents.append(fit[0])
+
+    return scaling_exponents
+
+# Perform detailed multifractal analysis with 'bior1.3'
+detailed_scaling_exponents = detailed_multifractal_analysis(returns.values, wavelet='bior1.3')
+
+print(f"Detailed Scaling Exponents for 'bior1.3': {detailed_scaling_exponents}")
+
+# Visualize the detailed scaling exponents
+plt.figure(figsize=(12, 6))
+plt.plot(range(1, len(detailed_scaling_exponents) + 1), detailed_scaling_exponents, marker='o', label='bior1.3')
+plt.title('Detailed Scaling Exponents for bior1.3 Wavelet')
+plt.xlabel('Wavelet Level')
+plt.ylabel('Scaling Exponent')
+plt.legend()
+plt.show()
+
+# Advanced Multifractal Detrended Fluctuation Analysis (MFDFA) with debugging and dynamic scales
+def MFDFA(time_series, min_scale=min_scale, max_scale=max_scale, q_values=np.linspace(-5, 5, 101)):
+    scales = np.logspace(np.log10(min_scale), np.log10(max_scale), num=50).astype(int)
+    fluct = np.zeros((len(q_values), len(scales)))
+
+    for i, q in enumerate(q_values):
+        for j, scale in enumerate(scales):
+            segments = len(time_series) // scale
+            rms = np.zeros(segments)
+
+            for k in range(segments):
+                segment = time_series[k*scale:(k+1)*scale]
+                trend = np.polyfit(range(scale), segment, 1)
+                fit = np.polyval(trend, range(scale))
+                rms[k] = np.sqrt(np.mean((segment - fit) ** 2))
+
+            if q == 0:
+                fluct[i, j] = np.mean(rms)
+            else:
+                fluct[i, j] = np.mean(rms ** q) ** (1/q)
+
+    H_q = np.zeros(len(q_values))
+    for i, q in enumerate(q_values):
+        valid = ~np.isnan(np.log(fluct[i, :])) & ~np.isinf(np.log(fluct[i, :]))
+        H_q[i] = np.polyfit(np.log(scales)[valid], np.log(fluct[i, :])[valid], 1)[0]
+
+    return H_q
+
+# Perform MFDFA
+q_values = np.linspace(-5, 5, 101)
+H_q = MFDFA(returns.values, q_values=q_values)
+
+# Visualize MFDFA results
+plt.figure(figsize=(12, 6))
+plt.plot(q_values, H_q, marker='o')
+plt.title('MFDFA Results')
+plt.xlabel('q')
+plt.ylabel('H(q)')
+plt.grid(True)
+plt.show()
+
+# Train a RandomForestRegressor model to predict returns
+hist['Lagged_Returns'] = hist['Close'].pct_change().shift(-1)
+features = ['Open', 'High', 'Low', 'Close', 'Volume', 'Lagged_Returns']
+data = hist.dropna()[features]
+
+X = data[['Open', 'High', 'Low', 'Close', 'Volume']]
+y = data['Lagged_Returns']
+
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Normalize features
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# Train the model
+model = RandomForestRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# Predict and evaluate the model
+y_pred = model.predict(X_test)
+mse = mean_squared_error(y_test, y_pred)
+print(f"Mean Squared Error: {mse}")
+
+# Integrate with quantum annealing for trading algorithm
+def trading_algorithm(hist, model, scaler):
+    balance = 100000  # Initial balance
+    shares = 0
+    trade_log = []
+
+    # Prepare quantum optimization problem
+    qp = QuadraticProgram()
+    qp.binary_var('buy')
+    qp.binary_var('sell')
+    qp.minimize(linear=[1, 1])
+
+    backend = Aer.get_backend('qasm_simulator')
+    algorithm_globals.random_seed = 12345
+    qaoa = QAOA(optimizer=None, reps=3, quantum_instance=backend)
+    optimizer = MinimumEigenOptimizer(qaoa)
+
+    for i in range(len(hist) - 1):
+        current_data = hist.iloc[i]
+        next_data = hist.iloc[i + 1]
+
+        X_new = scaler.transform([current_data[['Open', 'High', 'Low', 'Close', 'Volume']]])
+        predicted_return = model.predict(X_new)[0]
+
+        if predicted_return > 0 and balance >= current_data['Close'] * 100:
+            qp.objective.linear = [0, 1]  # Set objective to 'sell'
+        elif predicted_return < 0 and shares >= 100:
+            qp.objective.linear = [1, 0]  # Set objective to 'buy'
+        else:
+            qp.objective.linear = [0, 0]  # Set objective to 'hold'
+
+        result = optimizer.solve(qp)
+        decision = result.x
+
+        if decision[0] == 1:  # Buy decision
+            shares += 100
+            balance -= current_data['Close'] * 100
+            trade_log.append((current_data.name, 'Buy', 100, current_data['Close']))
+        elif decision[1] == 1:  # Sell decision
+            shares -= 100
+            balance += current_data['Close'] * 100
+            trade_log.append((current_data.name, 'Sell', 100, current_data['Close']))
+
+    return balance, shares, trade_log
+
+# Apply the trading algorithm
+final_balance, final_shares, trade_log = trading_algorithm(hist, model, scaler)
+print(f"Final Balance: {final_balance}, Final Shares: {final_shares}")
+
+# Display trade log
+for trade in trade_log:
+    print(f"Date: {trade[0]}, Action: {trade[1]}, Shares: {trade[2]}, Price: {trade[3]}")
