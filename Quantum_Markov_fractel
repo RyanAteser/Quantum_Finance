@@ -1,0 +1,172 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from scipy.stats import norm, kstest, levy_stable, t
+import pywt
+from qiskit import Aer, transpile, execute
+from qiskit.circuit import QuantumCircuit, QuantumRegister, ClassicalRegister
+from qiskit.visualization import plot_histogram
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, SMAIndicator
+
+def fetch_stock_data(ticker, period="5y"):
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period=period)
+    hist['Returns'] = hist['Close'].pct_change().dropna()
+    hist['RSI'] = RSIIndicator(hist['Close']).rsi()
+    macd = MACD(hist['Close'])
+    hist['MACD'] = macd.macd()
+    hist['Signal'] = macd.macd_signal()
+    hist['SMA'] = SMAIndicator(hist['Close']).sma_indicator()
+    hist['Fractal_Dimension'] = hist['Close'].apply(calculate_fractal_dimension)
+    hist.dropna(inplace=True)
+    return hist
+
+def calculate_fractal_dimension(series):
+    N = len(series)
+    span = np.linspace(1, N, N)
+    x = np.log(span)
+    y = np.log(series.cumsum())
+    A = np.vstack([x, np.ones(len(x))]).T
+    m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+    return m
+
+def normalize_features(hist):
+    features = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD', 'Signal', 'SMA', 'Fractal_Dimension']
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(hist[features])
+    return pd.DataFrame(scaled_features, columns=features), scaler
+
+def determine_levels(volume):
+    avg_volume = np.mean(volume)
+    std_volume = np.std(volume)
+    return max(1, int(np.log2(avg_volume / std_volume)))
+
+def calculate_transition_matrix(bins, n_bins):
+    transition_matrix = np.zeros((n_bins, n_bins))
+    for (i, j) in zip(bins, bins[1:]):
+        transition_matrix[i-1, j-1] += 1
+    transition_matrix = transition_matrix / transition_matrix.sum(axis=1, keepdims=True)
+    return transition_matrix
+
+def quantum_markov_chain_step(current_state, transition_matrix):
+    n = len(transition_matrix)
+    qr = QuantumRegister(n)
+    cr = ClassicalRegister(n)
+    qc = QuantumCircuit(qr, cr)
+
+    for i in range(n):
+        if transition_matrix[current_state, i] > 0:
+            qc.ry(2 * np.arccos(np.sqrt(transition_matrix[current_state, i])), qr[i])
+
+    qc.measure(qr, cr)
+
+    simulator = Aer.get_backend('qasm_simulator')
+    compiled_circuit = transpile(qc, simulator)
+    result = execute(compiled_circuit, simulator, shots=1024).result()
+    counts = result.get_counts()
+
+    next_state_probabilities = np.zeros(n)
+    for key, count in counts.items():
+        next_state = int(key[::-1], 2)
+        next_state_probabilities[next_state] += count / 1024
+
+    return next_state_probabilities
+
+def predict_next_state(returns, n_bins=10):
+    hist, bin_edges = np.histogram(returns, bins=n_bins, density=True)
+    bins = np.digitize(returns, bin_edges[:-1])
+    transition_matrix = calculate_transition_matrix(bins, n_bins)
+    current_state = bins[-1] - 1
+    next_state_probabilities = quantum_markov_chain_step(current_state, transition_matrix)
+    predicted_next_state = np.argmax(next_state_probabilities)
+    return current_state, next_state_probabilities, predicted_next_state
+
+def plot_results(returns, next_state_probabilities):
+    plt.figure(figsize=(12, 6))
+    plt.plot(returns)
+    plt.title('Daily Returns')
+    plt.xlabel('Time')
+    plt.ylabel('Returns')
+    plt.show()
+
+    plot_histogram(next_state_probabilities)
+    plt.title('Next State Probabilities')
+    plt.show()
+
+def backtest_trading_strategy(hist, model, scaler):
+    balance = 100000  # Initial balance
+    shares = 0
+    trade_log = []
+
+    features = ['Open', 'High', 'Low', 'Close', 'Volume', 'RSI', 'MACD', 'Signal', 'SMA', 'Fractal_Dimension']
+    scaled_features = scaler.transform(hist[features])
+
+    for i in range(len(hist) - 1):
+        current_data = scaled_features[i]
+        next_data = scaled_features[i + 1]
+
+        predicted_return = model.predict([current_data])[0]
+
+        if predicted_return > 0 and balance >= hist.iloc[i]['Close'] * 100:
+            # Buy 100 shares
+            shares += 100
+            balance -= hist.iloc[i]['Close'] * 100
+            trade_log.append((hist.index[i], 'Buy', 100, hist.iloc[i]['Close']))
+        elif predicted_return < 0 and shares >= 100:
+            # Sell 100 shares
+            shares -= 100
+            balance += hist.iloc[i]['Close'] * 100
+            trade_log.append((hist.index[i], 'Sell', 100, hist.iloc[i]['Close']))
+
+    return balance, shares, trade_log
+
+def main():
+    ticker = 'AAPL'
+    hist = fetch_stock_data(ticker)
+    normalized_features, scaler = normalize_features(hist)
+    hist['Lagged_Returns'] = hist['Returns'].shift(-1)
+    data = normalized_features.join(hist['Lagged_Returns']).dropna()
+
+    X = data.drop('Lagged_Returns', axis=1)
+    y = data['Lagged_Returns']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Hyperparameter tuning for RandomForestRegressor
+    param_grid = {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [None, 10, 20, 30],
+        'min_samples_split': [2, 5, 10]
+    }
+    rf = RandomForestRegressor(random_state=42)
+    grid_search = GridSearchCV(estimator=rf, param_grid=param_grid, cv=5, n_jobs=-1, scoring='neg_mean_squared_error')
+    grid_search.fit(X_train, y_train)
+
+    best_rf = grid_search.best_estimator_
+    y_pred = best_rf.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    print(f"Best Parameters: {grid_search.best_params_}")
+    print(f"Mean Squared Error: {mse}")
+
+    current_state, next_state_probabilities, predicted_next_state = predict_next_state(hist['Returns'])
+
+    print(f"Current State: {current_state}")
+    print(f"Next State Probabilities: {next_state_probabilities}")
+    print(f"Predicted Next State: {predicted_next_state}")
+
+    plot_results(hist['Returns'], next_state_probabilities)
+
+    final_balance, final_shares, trade_log = backtest_trading_strategy(hist, best_rf, scaler)
+    print(f"Final Balance: {final_balance}, Final Shares: {final_shares}")
+
+    for trade in trade_log:
+        print(f"Date: {trade[0]}, Action: {trade[1]}, Shares: {trade[2]}, Price: {trade[3]}")
+
+if __name__ == "__main__":
+    main()
